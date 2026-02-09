@@ -1,0 +1,9 @@
+.github/
+*__pycache__/
+*.pyc
+outputs/
+outputs_ad/
+configs/label_map.json
+*.pth
+comparison_results.json
+dinov3_pretrained/test_results/

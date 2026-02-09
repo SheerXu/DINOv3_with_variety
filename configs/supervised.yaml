@@ -1,0 +1,32 @@
+data:
+  train_dir: train_data/template
+  val_dir: train_data/template
+  image_exts: [".png", ".jpg", ".jpeg"]
+  resize: [512, 512]  # 例如 [512, 512]
+  random_flip: true
+  num_workers: 2
+  batch_size: 2
+  ignore_index: 255
+  label_map:
+    - bg
+    - 方槽毛刺
+    - 焊接面毛刺
+
+model:
+  dinov3_repo_path: dinov3  # DINOv3 源码仓库路径（需含 hubconf.py）
+  model_name: dinov3_vitb16
+  pretrained_path: dinov3_pretrained/dinov3_vitb16.pth
+  patch_size: 16
+  embed_dim: 768
+
+train:
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.05
+  amp: true
+  log_interval: 10
+  save_dir: outputs        # DINOv3 权重输出目录
+  save_every: 5            # 保存频率 per epoch
+
+eval:
+  batch_size: 1
