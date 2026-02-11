@@ -7,3 +7,5 @@ configs/label_map.json
 *.pth
 comparison_results.json
 dinov3_pretrained/test_results/
+train_data/
+test_data/

@@ -10,7 +10,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
 
-from src.datasets.anomaly_generator import AnomalyGenerator
+from .anomaly_generator import AnomalyGenerator
 
 
 class AnomalyDetectionDataset(Dataset):

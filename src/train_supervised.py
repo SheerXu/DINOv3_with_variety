@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.datasets.supervised_dataset import PolygonJsonDataset, pad_collate
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.models.supervised_segmentation import SegmentationModel
-from src.utils.config import ensure_dir, load_config
+from .datasets.supervised_dataset import PolygonJsonDataset, pad_collate
+from .models.dinov3_backbone import Dinov3Backbone
+from .models.supervised_segmentation import SegmentationModel
+from .utils.config import ensure_dir, load_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,14 +64,14 @@ def main() -> None:
         lr=train_cfg.get("lr", 1e-4),
         weight_decay=train_cfg.get("weight_decay", 0.05),
     )
-
+    # AMP 混合精度训练 - 梯度缩放
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", True))
     save_dir = ensure_dir(train_cfg.get("save_dir", "outputs"))
 
     epochs = train_cfg.get("epochs", 50)
     log_interval = train_cfg.get("log_interval", 10)
     ignore_index = data_cfg.get("ignore_index", 255)
-
+    
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0

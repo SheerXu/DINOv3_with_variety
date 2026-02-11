@@ -9,10 +9,10 @@ import torch
 from PIL import Image
 from torchvision.transforms import functional as F
 
-from src.models.anomaly_detector import AnomalyDetector
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.utils.config import load_config
-from src.utils.visualization import visualize_anomaly
+from .models.anomaly_detector import AnomalyDetector
+from .models.dinov3_backbone import Dinov3Backbone
+from .utils.config import load_config
+from .utils.visualization import visualize_anomaly
 
 
 def parse_args() -> argparse.Namespace:

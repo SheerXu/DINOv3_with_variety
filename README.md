@@ -8,7 +8,7 @@
 
 ### 环境安装
 ```bash
-pip install torch torchvision pyyaml numpy pillow matplotlib scikit-learn
+pip install -r requirements.txt
 ```
 
 ### 数据准备

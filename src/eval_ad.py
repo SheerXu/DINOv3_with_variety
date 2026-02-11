@@ -8,10 +8,10 @@ import torch
 from sklearn.metrics import auc, precision_recall_curve, roc_auc_score, roc_curve
 from torch.utils.data import DataLoader
 
-from src.datasets.anomaly_dataset import AnomalyDetectionDataset
-from src.models.anomaly_detector import AnomalyDetector
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.utils.config import load_config
+from .datasets.anomaly_dataset import AnomalyDetectionDataset
+from .models.anomaly_detector import AnomalyDetector
+from .models.dinov3_backbone import Dinov3Backbone
+from .utils.config import load_config
 
 
 def parse_args() -> argparse.Namespace:

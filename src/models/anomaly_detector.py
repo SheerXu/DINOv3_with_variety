@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.models.memory_bank import MemoryBank
+from .dinov3_backbone import Dinov3Backbone
+from .memory_bank import MemoryBank
 
 
 class AnomalyDetector(nn.Module):

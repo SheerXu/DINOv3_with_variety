@@ -7,10 +7,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.datasets.supervised_dataset import PolygonJsonDataset, pad_collate
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.models.supervised_segmentation import SegmentationModel
-from src.utils.config import load_config
+from .datasets.supervised_dataset import PolygonJsonDataset, pad_collate
+from .models.dinov3_backbone import Dinov3Backbone
+from .models.supervised_segmentation import SegmentationModel
+from .utils.config import load_config
 
 
 def parse_args() -> argparse.Namespace:

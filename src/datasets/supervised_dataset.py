@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
 
-from src.utils.label_map import build_label_map
+from ..utils.label_map import build_label_map
 
 
 class PolygonJsonDataset(Dataset):

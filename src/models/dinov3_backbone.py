@@ -24,8 +24,10 @@ class Dinov3Backbone(nn.Module):
         if not repo_path.exists():
             raise FileNotFoundError(f"DINOv3 repo not found: {repo_path}")
 
+        # 加载本地DINOv3模型结构
         self.model = torch.hub.load(str(repo_path), model_name, source="local")
 
+        # 加载预训练权重
         if pretrained_path:
             ckpt = torch.load(pretrained_path, map_location="cpu")
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -37,11 +39,12 @@ class Dinov3Backbone(nn.Module):
         if tokens.dim() != 3:
             raise ValueError("Expected tokens with shape (B, N, C)")
         if tokens.shape[1] % 2 == 1:
-            tokens = tokens[:, 1:, :]
+            tokens = tokens[:, 1:, :]   # 去除第一个token（CLS标记）
         b, n, c = tokens.shape
-        h = w = int(n ** 0.5)
+        h = w = int(n ** 0.5)   # 重建空间维度
         if h * w != n:
             raise ValueError("Token count is not a perfect square; please check patch size.")
+        # 转换为特征图 (B, C, H, W)
         feat = tokens.transpose(1, 2).contiguous().view(b, c, h, w)
         return feat
 

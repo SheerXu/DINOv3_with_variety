@@ -9,10 +9,10 @@ import torch
 from PIL import Image
 from torchvision.transforms import functional as F
 
-from src.models.dinov3_backbone import Dinov3Backbone
-from src.models.supervised_segmentation import SegmentationModel
-from src.utils.config import load_config
-from src.utils.visualization import visualize_segmentation
+from .models.dinov3_backbone import Dinov3Backbone
+from .models.supervised_segmentation import SegmentationModel
+from .utils.config import load_config
+from .utils.visualization import visualize_segmentation
 
 
 def parse_args() -> argparse.Namespace:
