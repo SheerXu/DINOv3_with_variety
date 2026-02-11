@@ -15,6 +15,7 @@ class Dinov3Backbone(nn.Module):
         pretrained_path: str | Path | None,
         patch_size: int,
         embed_dim: int,
+        download: bool = False
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -25,14 +26,34 @@ class Dinov3Backbone(nn.Module):
             raise FileNotFoundError(f"DINOv3 repo not found: {repo_path}")
 
         # 加载本地DINOv3模型结构
-        self.model = torch.hub.load(str(repo_path), model_name, source="local")
+        if download:
+            print(f"Loading model '{model_name}' with automatic weight download...")
+        else:
+            print(f"Loading model '{model_name}' structure (no automatic download)...")
+        
+        self.model = torch.hub.load(
+            str(repo_path), 
+            model_name, 
+            source="local",
+            pretrained=download  # 根据配置决定是否自动下载权重
+        )
 
-        # 加载预训练权重
-        if pretrained_path:
+        # 手动加载预训练权重（当不自动下载时）
+        if not download and pretrained_path:
+            pretrained_path = Path(pretrained_path)
+            if not pretrained_path.exists():
+                raise FileNotFoundError(f"Pretrained weights not found: {pretrained_path}")
+            
+            print(f"Loading pretrained weights from: {pretrained_path}")
             ckpt = torch.load(pretrained_path, map_location="cpu")
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 ckpt = ckpt["state_dict"]
-            self.model.load_state_dict(ckpt, strict=False)
+            missing, unexpected = self.model.load_state_dict(ckpt, strict=False)
+            print(f"Loaded pretrained weights. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        elif not download and not pretrained_path:
+            print("Warning: No pretrained weights specified, using random initialization")
+        elif download:
+            print(f"Using automatically downloaded pretrained weights.")
 
     def _tokens_to_feature(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: (B, N, C), remove cls token if present

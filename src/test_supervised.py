@@ -53,6 +53,7 @@ def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
         pretrained_path=None,  # 从checkpoint加载
         patch_size=model_cfg["patch_size"],
         embed_dim=model_cfg["embed_dim"],
+        download=model_cfg.get("download", False)
     )
     model = SegmentationModel(backbone, num_classes=num_classes)
     

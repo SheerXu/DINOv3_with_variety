@@ -44,6 +44,7 @@ def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
         pretrained_path=model_cfg.get("pretrained_path"),
         patch_size=model_cfg["patch_size"],
         embed_dim=model_cfg["embed_dim"],
+        download=model_cfg.get("download", False)
     )
     
     # 构建异常检测器

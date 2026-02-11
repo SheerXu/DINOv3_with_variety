@@ -14,10 +14,11 @@ data:
 
 model:
   dinov3_repo_path: dinov3  # DINOv3 源码仓库路径（需含 hubconf.py）
-  model_name: dinov3_vitb16
-  pretrained_path: dinov3_pretrained/dinov3_vitb16.pth
+  model_name: dinov3_vitl16
+  pretrained_path: dinov3_pretrained/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth
+  download: false  # 是否自动下载预训练权重（本地已有权重时设为 false）
   patch_size: 16
-  embed_dim: 768
+  embed_dim: 1024  # ViT-L/16 的嵌入维度是 1024
 
 train:
   epochs: 50

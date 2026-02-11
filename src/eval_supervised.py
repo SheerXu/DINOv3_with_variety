@@ -73,6 +73,7 @@ def main() -> None:
         pretrained_path=model_cfg.get("pretrained_path"),
         patch_size=model_cfg["patch_size"],
         embed_dim=model_cfg["embed_dim"],
+        download=model_cfg.get("download", False)
     )
     model = SegmentationModel(backbone, num_classes=num_classes)
 
