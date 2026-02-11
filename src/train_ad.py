@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Dict
+
+# 添加项目根目录到 Python 路径
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .datasets.anomaly_dataset import AnomalyDetectionDataset
-from .models.anomaly_detector import AnomalyDetector
-from .models.dinov3_backbone import Dinov3Backbone
-from .utils.config import ensure_dir, load_config
+from src.datasets.anomaly_dataset import AnomalyDetectionDataset
+from src.models.anomaly_detector import AnomalyDetector
+from src.models.dinov3_backbone import Dinov3Backbone
+from src.utils.config import ensure_dir, load_config
 
 
 def parse_args() -> argparse.Namespace:

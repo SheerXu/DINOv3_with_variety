@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 from typing import Dict
+
+# 添加项目根目录到 Python 路径
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .datasets.supervised_dataset import PolygonJsonDataset, pad_collate
-from .models.dinov3_backbone import Dinov3Backbone
-from .models.supervised_segmentation import SegmentationModel
-from .utils.config import load_config
+from src.datasets.supervised_dataset import PolygonJsonDataset, pad_collate
+from src.models.dinov3_backbone import Dinov3Backbone
+from src.models.supervised_segmentation import SegmentationModel
+from src.utils.config import load_config
 
 
 def parse_args() -> argparse.Namespace:
