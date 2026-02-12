@@ -30,6 +30,8 @@ class AnomalyDetector(nn.Module):
         
         # Student: 可微调的分支
         self.student = copy.deepcopy(backbone)
+        for param in self.student.parameters():
+            param.requires_grad = True
         
         self.use_multi_scale = use_multi_scale
         self.embed_dim = backbone.embed_dim
