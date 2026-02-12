@@ -66,8 +66,10 @@ class MemoryBank(nn.Module):
         bank_size = int(self.ptr) if not self.is_full else self.bank_size
         similarity = torch.mm(query_features, self.features[:bank_size].t())
         
-        # 距离 = 1 - 余弦相似度
-        distances = 1 - similarity
+        # 距离 = (1 - 余弦相似度) / 2，确保范围在 [0, 1]
+        # 余弦相似度范围 [-1, 1]，所以 (1 - similarity) 范围 [0, 2]
+        # 除以 2 后范围变为 [0, 1]
+        distances = (1 - similarity) / 2.0
         
         # 取 top-k 最近邻的平均距离
         topk_distances, _ = torch.topk(distances, k=min(k, bank_size), dim=1, largest=False)
