@@ -100,35 +100,38 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
+            # 前向传播（在 autocast 下）
             with torch.amp.autocast('cuda', enabled=train_cfg.get("amp", True)):
-                # 前向传播
                 anomaly_map, teacher_feat = detector(images, return_features=True)
-
-                # 损失计算
-                # 1. Focal Loss for anomaly segmentation
-                pred_flat = anomaly_map.view(-1)
-                target_flat = masks.view(-1)
-                # anomaly_map 已经是 0-1 范围的异常分数，可以直接计算 BCE
-                # 使用 clamp 避免数值问题
-                pred_flat = pred_flat.clamp(min=1e-7, max=1 - 1e-7)
-                bce_loss = F.binary_cross_entropy(
-                    pred_flat, target_flat, reduction="none"
-                )
-                pt = torch.exp(-bce_loss)
-                focal_loss = ((1 - pt) ** 2 * bce_loss).mean()
-
-                # 2. Feature distance loss (Student vs Teacher)
+                
+                # Feature distance loss (Student vs Teacher)
                 if epoch > warmup_epochs:
                     # Warmup 后才加入特征蒸馏
                     student_feat = detector.student(images)
                     dist_loss = detector.compute_distance_loss(student_feat, teacher_feat)
-                    loss = focal_loss + 0.5 * dist_loss
-                    total_dist += dist_loss.item()
                 else:
-                    loss = focal_loss
-                    dist_loss = torch.tensor(0.0)
+                    dist_loss = None
+            
+            # Focal Loss for anomaly segmentation（在 autocast 外部计算 BCE）
+            pred_flat = anomaly_map.view(-1)
+            target_flat = masks.view(-1)
+            # anomaly_map 已经是 0-1 范围的异常分数，可以直接计算 BCE
+            # 使用 clamp 避免数值问题
+            pred_flat = pred_flat.clamp(min=1e-7, max=1 - 1e-7)
+            bce_loss = F.binary_cross_entropy(
+                pred_flat, target_flat, reduction="none"
+            )
+            pt = torch.exp(-bce_loss)
+            focal_loss = ((1 - pt) ** 2 * bce_loss).mean()
+            
+            # 合并损失
+            if dist_loss is not None:
+                loss = focal_loss + 0.5 * dist_loss
+                total_dist += dist_loss.item()
+            else:
+                loss = focal_loss
 
-                total_focal += focal_loss.item()
+            total_focal += focal_loss.item()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
