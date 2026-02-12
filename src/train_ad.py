@@ -112,15 +112,10 @@ def main() -> None:
                 
                 # Feature distance loss (Student vs Teacher)
                 if epoch > warmup_epochs:
-                    # Warmup 后才加入特征蒸馏
                     student_feat = detector.student(images)
                     dist_loss = detector.compute_distance_loss(student_feat, teacher_feat)
                 else:
                     dist_loss = None
-            
-            # Focal Loss for anomaly segmentation（在 autocast 外部计算 BCE）
-            pred_flat = anomaly_map.view(-1)
-            target_flat = masks.view(-1)
             
             # 第一个 batch 输出调试信息
             if epoch == 1 and step == 1:
@@ -130,12 +125,17 @@ def main() -> None:
                       f"has_nan: {torch.isnan(anomaly_map).any().item()}, "
                       f"has_inf: {torch.isinf(anomaly_map).any().item()}")
             
+            # Focal Loss for anomaly segmentation（在 autocast 外部）
+            # 转换为 float32 以确保数值稳定性
+            anomaly_map = anomaly_map.float()
+            pred_flat = anomaly_map.view(-1)
+            target_flat = masks.view(-1).float()
+            
             # 检查并修正异常值
-            # 替换 NaN 和 Inf 为安全值
             pred_flat = torch.nan_to_num(pred_flat, nan=0.5, posinf=1.0, neginf=0.0)
-            # anomaly_map 应该在 0-1 范围，使用 clamp 确保
             pred_flat = pred_flat.clamp(min=1e-7, max=1.0 - 1e-7)
             
+            # Focal Loss 计算
             bce_loss = F.binary_cross_entropy(
                 pred_flat, target_flat, reduction="none"
             )
@@ -144,16 +144,25 @@ def main() -> None:
             
             # 合并损失
             if dist_loss is not None:
-                loss = focal_loss + 0.5 * dist_loss
+                loss = focal_loss + 0.5 * dist_loss.float()
                 total_dist += dist_loss.item()
             else:
                 loss = focal_loss
 
             total_focal += focal_loss.item()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # 反向传播（处理 AMP）
+            if train_cfg.get("amp", True):
+                # 使用 scaler（仅对在 autocast 内的操作）
+                # 由于损失部分在 autocast 外，需要特殊处理
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)  # 在 step 前 unscale
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 不使用 AMP
+                loss.backward()
+                optimizer.step()
 
             # 更新记忆库（仅用正常样本）
             with torch.no_grad():
