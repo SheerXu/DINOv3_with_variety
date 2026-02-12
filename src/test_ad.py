@@ -18,7 +18,7 @@ from torchvision.transforms import functional as F
 from src.models.anomaly_detector import AnomalyDetector
 from src.models.dinov3_backbone import Dinov3Backbone
 from src.utils.config import load_config
-from src.utils.visualization import visualize_anomaly
+from src.utils.visualization import visualize_segmentation
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,12 +87,15 @@ def predict(detector, image_tensor: torch.Tensor, device: torch.device, original
     
     # 获取异常分数图（已经是 0-1 范围的距离分数）
     anomaly_map = detector(image_tensor)
-    anomaly_map = anomaly_map.squeeze(0).squeeze(0).cpu().numpy()
-    
-    # 调整到原始尺寸
-    anomaly_image = Image.fromarray((anomaly_map * 255).astype(np.uint8))
-    anomaly_image = anomaly_image.resize(original_size, Image.BILINEAR)
-    anomaly_map = np.array(anomaly_image).astype(np.float32) / 255.0
+    # 在浮点张量空间完成 resize，避免 uint8 量化带来的伪影
+    target_h, target_w = original_size[1], original_size[0]
+    anomaly_map = torch.nn.functional.interpolate(
+        anomaly_map,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    anomaly_map = anomaly_map.squeeze(0).squeeze(0).clamp(0.0, 1.0).cpu().numpy()
     
     return anomaly_map
 
@@ -115,6 +118,9 @@ def process_single_image(
     
     # 推理
     anomaly_map = predict(detector, image_tensor, device, original_size)
+
+    # 二值化预测图（0=正常, 1=异常）
+    pred_mask = (anomaly_map > threshold).astype(np.uint8)
     
     # 计算统计信息
     max_score = anomaly_map.max()
@@ -134,12 +140,12 @@ def process_single_image(
     else:
         output_path = output_dir / f"{image_path.stem}_result.png"
     
-    # 可视化
-    visualize_anomaly(
+    # 可视化（仿照 test_supervised：仅原图 + 预测图）
+    visualize_segmentation(
         image=image_np,
-        anomaly_map=anomaly_map,
-        threshold=threshold,
+        pred_mask=pred_mask,
         gt_mask=None,
+        label_map={"background": 0, "anomaly": 1},
         save_path=output_path,
         show=show,
     )

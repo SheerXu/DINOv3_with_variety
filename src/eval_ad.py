@@ -12,7 +12,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 import torch
-from sklearn.metrics import auc, precision_recall_curve, roc_auc_score, roc_curve
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch.utils.data import DataLoader
 
 from src.datasets.anomaly_dataset import AnomalyDetectionDataset
@@ -25,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--threshold", type=float, default=0.5)
     return parser.parse_args()
 
 
@@ -58,6 +67,21 @@ def compute_metrics(anomaly_scores: np.ndarray, labels: np.ndarray) -> Dict:
         "Best_Threshold": best_threshold,
         "Precision@BestF1": precision[best_f1_idx],
         "Recall@BestF1": recall[best_f1_idx],
+    }
+
+
+def compute_threshold_metrics(anomaly_scores: np.ndarray, labels: np.ndarray, threshold: float) -> Dict:
+    """基于固定阈值的二值指标（与 test_ad 可视化口径一致）"""
+    pred = (anomaly_scores > threshold).astype(np.uint8)
+    gt = labels.astype(np.uint8)
+
+    return {
+        "Threshold": threshold,
+        "Accuracy": accuracy_score(gt, pred),
+        "Precision": precision_score(gt, pred, zero_division=0),
+        "Recall": recall_score(gt, pred, zero_division=0),
+        "F1": f1_score(gt, pred, zero_division=0),
+        "Positive_Ratio": float(pred.mean()),
     }
 
 
@@ -117,6 +141,8 @@ def main() -> None:
     pixel_scores = []
     pixel_labels = []
 
+    threshold = float(args.threshold)
+
     with torch.no_grad():
         for images, masks, labels in test_loader:
             images = images.to(device)
@@ -134,25 +160,40 @@ def main() -> None:
 
             # Pixel-level
             pixel_scores.append(anomaly_map.flatten())
-            pixel_labels.append(masks.flatten())
+            pixel_labels.append((masks.flatten() > 0.5).astype(np.uint8))
 
     # Image-level metrics
     all_scores = np.array(all_scores)
     all_labels = np.array(all_labels)
     img_metrics = compute_metrics(all_scores, all_labels)
+    img_threshold_metrics = compute_threshold_metrics(all_scores, all_labels, threshold)
 
     print("\n=== AD-DINOv3 Image-Level Metrics ===")
     for key, value in img_metrics.items():
         print(f"{key}: {value:.4f}")
+    print("\n=== AD-DINOv3 Image-Level Metrics @ Fixed Threshold ===")
+    for key, value in img_threshold_metrics.items():
+        if key == "Threshold":
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value:.4f}")
 
     # Pixel-level metrics
     pixel_scores = np.concatenate(pixel_scores)
     pixel_labels = np.concatenate(pixel_labels)
     pixel_metrics = compute_metrics(pixel_scores, pixel_labels)
+    pixel_threshold_metrics = compute_threshold_metrics(pixel_scores, pixel_labels, threshold)
 
     print("\n=== AD-DINOv3 Pixel-Level Metrics ===")
     for key, value in pixel_metrics.items():
         print(f"{key}: {value:.4f}")
+
+    print("\n=== AD-DINOv3 Pixel-Level Metrics @ Fixed Threshold ===")
+    for key, value in pixel_threshold_metrics.items():
+        if key == "Threshold":
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value:.4f}")
 
 
 if __name__ == "__main__":

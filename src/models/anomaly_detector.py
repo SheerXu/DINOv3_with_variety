@@ -71,14 +71,10 @@ class AnomalyDetector(nn.Module):
         
         # Student 特征
         student_feat = self.student(x)
-        
-        if self.use_multi_scale:
-            # 融合 Teacher 和 Student 特征
-            combined = torch.cat([teacher_feat, student_feat], dim=1)
-            fused_feat = self.feature_fusion(combined)
-            feat_for_distance = fused_feat
-        else:
-            feat_for_distance = student_feat
+
+        # 使用 Student 特征查询记忆库（记忆库存储 Teacher 正常特征），
+        # 与 Teacher-Student 异常检测设定一致；避免融合特征与记忆库空间不一致导致分数混乱。
+        feat_for_distance = student_feat
         
         # 计算异常分数
         anomaly_map = self.memory_bank.get_nearest_distance(feat_for_distance, k=3)
