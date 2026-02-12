@@ -77,7 +77,12 @@ def main() -> None:
         weight_decay=train_cfg.get("weight_decay", 0.05),
     )
 
-    scaler = torch.amp.GradScaler('cuda', enabled=train_cfg.get("amp", True))
+    amp_requested = bool(train_cfg.get("amp", True))
+    amp_enabled = amp_requested and device.type == "cuda"
+    if amp_requested and not amp_enabled:
+        print("Warning: amp=True requested but CUDA is not available; AMP is disabled.")
+
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     save_dir = ensure_dir(train_cfg.get("save_dir", "outputs_ad"))
 
     epochs = train_cfg.get("epochs", 30)
@@ -88,6 +93,8 @@ def main() -> None:
     print(f"Memory bank warmup: {warmup_epochs} epochs")
     print(f"Memory bank size: {model_cfg.get('memory_bank_size', 1000)}")
     print(f"Initial bank state - ptr: {detector.memory_bank.ptr.item()}, is_full: {detector.memory_bank.is_full.item()}\n")
+
+    warned_no_grad = False
 
     for epoch in range(1, epochs + 1):
         detector.train()
@@ -107,7 +114,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             # 前向传播（在 autocast 下）
-            with torch.amp.autocast('cuda', enabled=train_cfg.get("amp", True)):
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
                 anomaly_map, teacher_feat = detector(images, return_features=True)
                 
                 # Feature distance loss (Student vs Teacher)
@@ -152,13 +159,28 @@ def main() -> None:
             total_focal += focal_loss.item()
 
             # 反向传播（处理 AMP）
-            if train_cfg.get("amp", True):
+            if amp_enabled:
                 # 使用 scaler（仅对在 autocast 内的操作）
                 # 由于损失部分在 autocast 外，需要特殊处理
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)  # 在 step 前 unscale
-                scaler.step(optimizer)
-                scaler.update()
+
+                # 如果这一轮没有任何梯度（例如：记忆库为空导致 anomaly_map 与参数无关），
+                # GradScaler.step() 会触发断言："No inf checks were recorded for this optimizer."。
+                has_any_grad = any(
+                    (p.grad is not None)
+                    for group in optimizer.param_groups
+                    for p in group["params"]
+                )
+                if has_any_grad:
+                    scaler.unscale_(optimizer)  # 在 step 前 unscale
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if not warned_no_grad:
+                        print(
+                            "Warning: no gradients found for optimizer params; skipping optimizer step this iteration."
+                        )
+                        warned_no_grad = True
             else:
                 # 不使用 AMP
                 loss.backward()
