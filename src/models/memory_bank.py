@@ -66,12 +66,9 @@ class MemoryBank(nn.Module):
         bank_size = int(self.ptr) if not self.is_full else self.bank_size
         if bank_size == 0:
             # 记忆库为空，返回中性异常分数（0.5）
-            anomaly_scores = torch.full(
-                (query_features.shape[0],), 
-                0.5, 
-                dtype=query_features.dtype, 
-                device=query_features.device
-            )
+            # 使用可微分操作保持计算图，避免梯度断裂
+            # query_features.mean(dim=1) * 0 结果为 0，但保留计算图
+            anomaly_scores = query_features.mean(dim=1) * 0.0 + 0.5
         else:
             # 相似度矩阵: (N, bank_size)
             similarity = torch.mm(query_features, self.features[:bank_size].t())
