@@ -70,19 +70,37 @@ class Dinov3Backbone(nn.Module):
         return feat
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 尝试使用 forward_features 方法（如果存在）
         if hasattr(self.model, "forward_features"):
             feats = self.model.forward_features(x)
         else:
             feats = self.model(x)
 
+        # 处理字典输出
         if isinstance(feats, dict):
-            for key in ["x", "last_hidden_state", "tokens", "features"]:
+            # 尝试常见的键名
+            for key in ["x_norm_patchtokens", "x", "last_hidden_state", "tokens", "features"]:
                 if key in feats:
                     feats = feats[key]
                     break
+            else:
+                # 如果都没找到，打印字典键并使用第一个张量值
+                print(f"Warning: Expected keys not found in output dict. Available keys: {list(feats.keys())}")
+                for key, value in feats.items():
+                    if isinstance(value, torch.Tensor):
+                        feats = value
+                        print(f"Using key '{key}' from output dict")
+                        break
+                else:
+                    raise ValueError(f"No tensor found in model output dict. Keys: {list(feats.keys())}")
 
+        # 确保 feats 是张量
+        if not isinstance(feats, torch.Tensor):
+            raise ValueError(f"Expected tensor output, got {type(feats)}")
+
+        # 根据维度处理特征
         if feats.dim() == 3:
             return self._tokens_to_feature(feats)
         if feats.dim() == 4:
             return feats
-        raise ValueError("Unsupported feature shape from backbone.")
+        raise ValueError(f"Unsupported feature shape: {feats.shape}, expected 3D or 4D tensor")

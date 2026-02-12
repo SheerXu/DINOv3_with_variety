@@ -72,7 +72,7 @@ def main() -> None:
         weight_decay=train_cfg.get("weight_decay", 0.05),
     )
     # AMP 混合精度训练 - 梯度缩放
-    scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", True))
+    scaler = torch.amp.GradScaler('cuda', enabled=train_cfg.get("amp", True))
     save_dir = ensure_dir(train_cfg.get("save_dir", "outputs"))
 
     epochs = train_cfg.get("epochs", 50)
@@ -87,7 +87,7 @@ def main() -> None:
             masks = masks.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=train_cfg.get("amp", True)):
+            with torch.amp.autocast('cuda', enabled=train_cfg.get("amp", True)):
                 logits = model(images)
                 loss = F.cross_entropy(logits, masks, ignore_index=ignore_index)
 
