@@ -1,10 +1,10 @@
 data:
-  train_dir: train_data/template
-  val_dir: train_data/template
+  train_dir: train_data/H68
+  val_dir: train_data/H68
   image_exts: [".png", ".jpg", ".jpeg"]
   resize: [512, 512]  # AD-DINOv3 建议固定分辨率
   num_workers: 2
-  batch_size: 4
+  batch_size: 8
 
 model:
   dinov3_repo_path: dinov3
@@ -13,17 +13,21 @@ model:
   download: false  # 是否自动下载预训练权重（本地已有权重时设为 false）
   patch_size: 16
   embed_dim: 1024  # ViT-L/16 的嵌入维度是 1024
-  memory_bank_size: 2000  # 记忆库大小
-  use_multi_scale: true   # 是否使用多尺度特征融合
+  clip:
+    model_name: ViT-L-14-336
+    pretrained: CLIP/ViT-L-14-336px.pt   # 根目录下本地 CLIP 权重
+    download: false                       # true=允许自动下载，false=仅使用本地文件
+  memory_bank_size: 2000  # 兼容旧配置字段（当前 adapter 训练不会使用）
+  use_multi_scale: true   # 兼容旧配置字段（当前 adapter 训练不会使用）
 
 train:
-  epochs: 30
+  epochs: 20
   lr: 0.0001
   weight_decay: 0.05
   amp: true
   log_interval: 10
   save_dir: outputs_ad       # AD-DINOv3 权重输出目录
-  save_every: 5              # 保存频率 per epoch
-  warmup_epochs: 5           # 记忆库预热轮数
+  save_every: 10              # 保存频率 per epoch
+  warmup_epochs: 2           # 记忆库预热轮数
   use_anomaly_generation: true  # 是否使用合成异常
   anomaly_ratio: 0.5         # 合成异常样本比例

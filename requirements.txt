@@ -5,3 +5,4 @@ numpy
 pillow
 scikit-learn
 matplotlib
+open-clip-torch

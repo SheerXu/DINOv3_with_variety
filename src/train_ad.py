@@ -2,28 +2,169 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 # 添加项目根目录到 Python 路径
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
 from src.datasets.anomaly_dataset import AnomalyDetectionDataset
-from src.models.anomaly_detector import AnomalyDetector
+from src.loss.ad_losses import BinaryDiceLoss, FocalLoss
+from src.models.ad_adapter import CLIPInplanted as AdapterModel
 from src.models.dinov3_backbone import Dinov3Backbone
+from src.utils.ad_clip import create_clip_model_and_tokenizer, encode_text_with_prompt_ensemble
 from src.utils.config import ensure_dir, load_config
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train AD-DINOv3 Adapter-style")
     parser.add_argument("--config", type=str, required=True)
     return parser.parse_args()
+
+
+def normalize_imagenet(images: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor(IMAGENET_MEAN, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=images.device).view(1, 3, 1, 1)
+    return (images - mean) / std
+
+
+def get_feature_dinov3(batch_img: torch.Tensor, device: torch.device, dino_model):
+    with torch.no_grad():
+        depth = len(dino_model.blocks)
+        idxs = [int(round((depth - 1) * k / (4 - 1))) for k in range(4)]
+        layers = sorted(set([max(0, min(depth - 1, idx)) for idx in idxs]))
+
+        patch_tokens_dict = {idx: [] for idx in layers}
+        cls_tokens_dict = {idx: [] for idx in layers}
+
+        anchor = getattr(dino_model, "norm", None) or getattr(dino_model, "fc_norm", None)
+        if anchor is None:
+            raise ValueError("DINO model has no norm/fc_norm module for feature extraction.")
+
+        batch_size = batch_img.shape[0]
+        for sample_idx in range(batch_size):
+            tokens_dict = {}
+            handles = []
+
+            image = batch_img[sample_idx].unsqueeze(0).to(device)
+
+            for layer_idx in layers:
+                def _mk_hook(idx):
+                    def _hook(_module, _inp, out):
+                        tokens_dict[idx] = anchor(out[0]).detach().cpu()
+
+                    return _hook
+
+                handles.append(dino_model.blocks[layer_idx].register_forward_hook(_mk_hook(layer_idx)))
+
+            _ = dino_model(image)
+
+            for handle in handles:
+                handle.remove()
+
+            for layer_idx, tokens in tokens_dict.items():
+                patch_tokens = tokens[:, 5:, :]
+                patch_tokens = (patch_tokens - patch_tokens.mean(dim=1, keepdim=True)) / (
+                    patch_tokens.std(dim=1, keepdim=True) + 1e-6
+                )
+                cls_tokens = tokens[:, 0, :].unsqueeze(1)
+
+                patch_tokens_dict[layer_idx].append(patch_tokens)
+                cls_tokens_dict[layer_idx].append(cls_tokens)
+
+        patch_tokens = [torch.cat(patch_tokens_dict[idx], dim=0).to(device) for idx in layers]
+        cls_token = [torch.cat(cls_tokens_dict[idx], dim=0).to(device) for idx in layers]
+        return cls_token, patch_tokens
+
+
+def get_anomaly_map(
+    clip_model,
+    clip_tokenizer,
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    labels: torch.Tensor,
+    obj_name: str,
+    device: torch.device,
+    adapter_model,
+    dino_model,
+):
+    masks = masks.clone()
+    masks[masks > 0.5] = 1
+    masks[masks <= 0.5] = 0
+
+    batch_size = images.shape[0]
+
+    text_feature = torch.zeros(batch_size, 768, 2, device=device)
+    with torch.no_grad():
+        for i in range(batch_size):
+            text_feature[i] = encode_text_with_prompt_ensemble(clip_model, clip_tokenizer, obj_name, device)
+
+    adjusted_feats_0 = []
+    adjusted_feats_1 = []
+    for i in range(batch_size):
+        f0 = adapter_model.prompt_adapter[0](text_feature[i, :, 0])[0]
+        f1 = adapter_model.prompt_adapter[1](text_feature[i, :, 1])[0]
+        adjusted_feats_0.append(f0)
+        adjusted_feats_1.append(f1)
+
+    adjusted_feats_0 = torch.stack(adjusted_feats_0, dim=0)
+    adjusted_feats_1 = torch.stack(adjusted_feats_1, dim=0)
+    adjusted_text_feature = torch.cat([adjusted_feats_0, adjusted_feats_1], dim=1).view(batch_size, 768, 2)
+
+    cls_token, patch_tokens = get_feature_dinov3(images, device, dino_model)
+
+    anomaly_map = []
+    anomaly_maps_cross_modal = []
+    global_anomaly_scores = []
+
+    for i in range(4):
+        cls_features = adapter_model.cls_token_adapter[i](cls_token[i])[0]
+        cls_features = cls_features / (cls_features.norm(dim=-1, keepdim=True) + 1e-6)
+
+        patch_features = adapter_model.patch_token_adapter[i](patch_tokens[i])[0]
+        patch_features = patch_features / (patch_features.norm(dim=-1, keepdim=True) + 1e-6)
+
+        anomaly_map_cross_modal = 100 * patch_features @ adjusted_text_feature
+        s = int((patch_tokens[i].shape[1]) ** 0.5)
+        anomaly_map_cross_modal = F.interpolate(
+            anomaly_map_cross_modal.permute(0, 2, 1).view(-1, 2, s, s),
+            size=images.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        anomaly_map_cross_modal = torch.softmax(anomaly_map_cross_modal, dim=1)
+        anomaly_maps_cross_modal.append(anomaly_map_cross_modal)
+
+        anomaly_awareness_cls_patch = 10 * patch_features @ cls_features.squeeze().unsqueeze(-1)
+        anomaly_awareness_cls_patch = F.interpolate(
+            anomaly_awareness_cls_patch.permute(0, 2, 1).view(-1, 1, s, s),
+            size=images.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        anomaly_awareness_cls_patch = torch.sigmoid(anomaly_awareness_cls_patch)
+        anomaly_map.append(torch.cat([1 - anomaly_awareness_cls_patch, anomaly_awareness_cls_patch], dim=1))
+
+        anomaly_score = 100 * cls_features @ adjusted_text_feature
+        global_anomaly_scores.append(anomaly_score)
+
+    anomaly_map_cross_modal = torch.mean(torch.stack(anomaly_maps_cross_modal, dim=0), dim=0)
+    anomaly_awareness = torch.mean(torch.stack(anomaly_map, dim=0), dim=0)
+    global_anomaly_score = torch.mean(torch.stack(global_anomaly_scores, dim=0), dim=0)
+
+    return anomaly_awareness, masks.unsqueeze(1), anomaly_map_cross_modal, global_anomaly_score, labels
 
 
 def main() -> None:
@@ -33,8 +174,8 @@ def main() -> None:
     data_cfg: Dict = cfg["data"]
     model_cfg: Dict = cfg["model"]
     train_cfg: Dict = cfg["train"]
+    clip_cfg: Dict = model_cfg.get("clip", {})
 
-    # 数据集
     train_ds = AnomalyDetectionDataset(
         root_dir=data_cfg["train_dir"],
         image_exts=data_cfg["image_exts"],
@@ -46,176 +187,158 @@ def main() -> None:
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=data_cfg.get("batch_size", 4),
+        batch_size=data_cfg.get("batch_size", 8),
         shuffle=True,
         num_workers=data_cfg.get("num_workers", 2),
     )
 
-    # 模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # DINOv3 backbone（参考仓库：冻结特征提取器）
     backbone = Dinov3Backbone(
         dinov3_repo_path=model_cfg["dinov3_repo_path"],
         model_name=model_cfg["model_name"],
         pretrained_path=model_cfg.get("pretrained_path"),
         patch_size=model_cfg["patch_size"],
         embed_dim=model_cfg["embed_dim"],
-        download=model_cfg.get("download", False)
+        download=model_cfg.get("download", False),
     )
+    dino_model = backbone.model.to(device)
+    dino_model.eval()
+    for param in dino_model.parameters():
+        param.requires_grad = False
 
-    detector = AnomalyDetector(
-        backbone=backbone,
-        memory_bank_size=model_cfg.get("memory_bank_size", 1000),
-        use_multi_scale=model_cfg.get("use_multi_scale", True),
+    # CLIP（参考仓库：ViT-L-14-336）
+    clip_model_name = clip_cfg.get("model_name", "ViT-L-14-336")
+    clip_pretrained = clip_cfg.get("pretrained", "CLIP/ViT-L-14-336px.pt")
+    clip_download = bool(clip_cfg.get("download", False))
+
+    clip_model, clip_tokenizer = create_clip_model_and_tokenizer(
+        model_name=clip_model_name,
+        pretrained=clip_pretrained,
+        device=device,
+        allow_download=clip_download,
     )
+    clip_model.to(device)
+    clip_model.eval()
+    for param in clip_model.parameters():
+        param.requires_grad = False
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    detector.to(device)
+    # Adapter model（参考仓库核心可训练模块）
+    adapter_model = AdapterModel(c_in=model_cfg.get("embed_dim", 1024), _device=device)
+    adapter_model.to(device)
+    adapter_model.train()
 
-    # 优化器（仅优化 Student 分支）
+    update_params = ["patch_token_adapter", "cls_token_adapter", "prompt_adapter"]
+    params_to_update: List[torch.nn.Parameter] = []
+    for name, param in adapter_model.named_parameters():
+        if any(key in name for key in update_params):
+            params_to_update.append(param)
+
     optimizer = torch.optim.AdamW(
-        detector.student.parameters(),
-        lr=train_cfg.get("lr", 1e-4),
-        weight_decay=train_cfg.get("weight_decay", 0.05),
+        params_to_update,
+        lr=train_cfg.get("lr", 1e-5),
+        betas=(0.9, 0.999),
+        weight_decay=train_cfg.get("weight_decay", 1e-2),
     )
 
-    amp_requested = bool(train_cfg.get("amp", True))
-    amp_enabled = amp_requested and device.type == "cuda"
-    if amp_requested and not amp_enabled:
-        print("Warning: amp=True requested but CUDA is not available; AMP is disabled.")
+    total_steps = max(1, train_cfg.get("epochs", 20) * max(1, len(train_loader)))
+    warmup_steps = int(0.03 * total_steps)
 
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    loss_focal = FocalLoss()
+    loss_dice = BinaryDiceLoss()
+
     save_dir = ensure_dir(train_cfg.get("save_dir", "outputs_ad"))
-
-    epochs = train_cfg.get("epochs", 30)
+    epochs = train_cfg.get("epochs", 20)
+    save_every = train_cfg.get("save_every", 10)
     log_interval = train_cfg.get("log_interval", 10)
-    warmup_epochs = train_cfg.get("warmup_epochs", 5)
+    obj_name = train_cfg.get("object_name", "defect")
 
-    print(f"Training AD-DINOv3 for {epochs} epochs")
-    print(f"Memory bank warmup: {warmup_epochs} epochs")
-    print(f"Memory bank size: {model_cfg.get('memory_bank_size', 1000)}")
-    print(f"Initial bank state - ptr: {detector.memory_bank.ptr.item()}, is_full: {detector.memory_bank.is_full.item()}\n")
+    print(f"Training AD-DINOv3 Adapter for {epochs} epochs")
+    print(f"Using object prompt name: {obj_name}")
 
-    warned_no_grad = False
+    global_step = 0
+    for epoch in range(epochs):
+        start_time = time.time()
+        adapter_model.train()
 
-    for epoch in range(1, epochs + 1):
-        detector.train()
-        total_loss = 0.0
-        total_focal = 0.0
-        total_dist = 0.0
-        
-        # 打印当前 epoch 的记忆库状态
-        bank_ptr = int(detector.memory_bank.ptr.item())
-        print(f"Epoch {epoch} - Memory bank contains {bank_ptr} samples")
+        awareness_loss_list = []
+        seg_loss_list = []
+        global_anomaly_loss_list = []
+        total_loss_list = []
 
         for step, (images, masks, labels) in enumerate(train_loader, start=1):
             images = images.to(device)
             masks = masks.to(device)
             labels = labels.to(device)
 
-            optimizer.zero_grad(set_to_none=True)
+            # 对齐参考仓库数据预处理（ImageNet 归一化）
+            images_norm = normalize_imagenet(images)
 
-            # 前向传播（在 autocast 下）
-            with torch.amp.autocast("cuda", enabled=amp_enabled):
-                anomaly_map, teacher_feat = detector(images, return_features=True)
-                
-                # Feature distance loss (Student vs Teacher)
-                if epoch > warmup_epochs:
-                    student_feat = detector.student(images)
-                    dist_loss = detector.compute_distance_loss(student_feat, teacher_feat)
-                else:
-                    dist_loss = None
-            
-            # 第一个 batch 输出调试信息
-            if epoch == 1 and step == 1:
-                print(f"  anomaly_map stats - min: {anomaly_map.min().item():.4f}, "
-                      f"max: {anomaly_map.max().item():.4f}, "
-                      f"mean: {anomaly_map.mean().item():.4f}, "
-                      f"has_nan: {torch.isnan(anomaly_map).any().item()}, "
-                      f"has_inf: {torch.isinf(anomaly_map).any().item()}")
-            
-            # Focal Loss for anomaly segmentation（在 autocast 外部）
-            # 转换为 float32 以确保数值稳定性
-            anomaly_map = anomaly_map.float()
-            pred_flat = anomaly_map.view(-1)
-            target_flat = masks.view(-1).float()
-            
-            # 检查并修正异常值
-            pred_flat = torch.nan_to_num(pred_flat, nan=0.5, posinf=1.0, neginf=0.0)
-            pred_flat = pred_flat.clamp(min=1e-7, max=1.0 - 1e-7)
-            
-            # Focal Loss 计算
-            bce_loss = F.binary_cross_entropy(
-                pred_flat, target_flat, reduction="none"
+            anomaly_map, mask, anomaly_map_cross_modal, global_anomaly_score, gt_label = get_anomaly_map(
+                clip_model=clip_model,
+                clip_tokenizer=clip_tokenizer,
+                images=images_norm,
+                masks=masks,
+                labels=labels,
+                obj_name=obj_name,
+                device=device,
+                adapter_model=adapter_model,
+                dino_model=dino_model,
             )
-            pt = torch.exp(-bce_loss)
-            focal_loss = ((1 - pt) ** 2 * bce_loss).mean()
-            
-            # 合并损失
-            if dist_loss is not None:
-                loss = focal_loss + 0.5 * dist_loss.float()
-                total_dist += dist_loss.item()
-            else:
-                loss = focal_loss
 
-            total_focal += focal_loss.item()
+            anomaly_awareness_loss = loss_focal(anomaly_map, mask) + loss_dice(anomaly_map[:, 1, :, :], mask)
+            seg_loss = loss_focal(anomaly_map_cross_modal, mask) + loss_dice(anomaly_map_cross_modal[:, 1, :, :], mask)
+            global_anomaly_loss = F.cross_entropy(global_anomaly_score.squeeze(1), gt_label.long())
+            loss = 0.25 * anomaly_awareness_loss + 0.5 * seg_loss + 0.25 * global_anomaly_loss
 
-            # 反向传播（处理 AMP）
-            if amp_enabled:
-                # 使用 scaler（仅对在 autocast 内的操作）
-                # 由于损失部分在 autocast 外，需要特殊处理
-                scaler.scale(loss).backward()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-                # 如果这一轮没有任何梯度（例如：记忆库为空导致 anomaly_map 与参数无关），
-                # GradScaler.step() 会触发断言："No inf checks were recorded for this optimizer."。
-                has_any_grad = any(
-                    (p.grad is not None)
-                    for group in optimizer.param_groups
-                    for p in group["params"]
-                )
-                if has_any_grad:
-                    scaler.unscale_(optimizer)  # 在 step 前 unscale
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    if not warned_no_grad:
-                        print(
-                            "Warning: no gradients found for optimizer params; skipping optimizer step this iteration."
-                        )
-                        warned_no_grad = True
-            else:
-                # 不使用 AMP
-                loss.backward()
-                optimizer.step()
+            awareness_loss_list.append(float(anomaly_awareness_loss.item()))
+            seg_loss_list.append(float(seg_loss.item()))
+            global_anomaly_loss_list.append(float(global_anomaly_loss.item()))
+            total_loss_list.append(float(loss.item()))
 
-            # 更新记忆库（仅用正常样本）
-            with torch.no_grad():
-                normal_mask = labels == 0
-                if normal_mask.any():
-                    normal_feat = teacher_feat[normal_mask]
-                    detector.update_memory_bank(normal_feat)
-
-            total_loss += loss.item()
-
+            global_step += 1
             if step % log_interval == 0:
-                avg_loss = total_loss / step
-                avg_focal = total_focal / step
-                avg_dist = total_dist / step if epoch > warmup_epochs else 0
                 print(
-                    f"Epoch {epoch}/{epochs} Step {step} "
-                    f"Loss {avg_loss:.4f} (Focal {avg_focal:.4f}, Dist {avg_dist:.4f})"
+                    f"Epoch {epoch + 1}/{epochs} Step {step}/{len(train_loader)} "
+                    f"Loss {np.mean(total_loss_list):.4f} "
+                    f"(Awareness {np.mean(awareness_loss_list):.4f}, "
+                    f"Seg {np.mean(seg_loss_list):.4f}, Global {np.mean(global_anomaly_loss_list):.4f})"
                 )
 
-        # 保存检查点
-        if epoch % train_cfg.get("save_every", 5) == 0:
-            ckpt_path = Path(save_dir) / f"ad_model_epoch_{epoch}.pth"
+        if (epoch + 1) % save_every == 0:
+            ckpt_path = Path(save_dir) / f"ad_adapter_epoch_{epoch + 1}.pth"
             torch.save(
                 {
-                    "detector": detector.state_dict(),
-                    "memory_bank": detector.memory_bank.state_dict(),
-                    "epoch": epoch,
+                    "cls_token_adapter": adapter_model.cls_token_adapter.state_dict(),
+                    "patch_token_adapter": adapter_model.patch_token_adapter.state_dict(),
+                    "prompt_adapter": adapter_model.prompt_adapter.state_dict(),
+                    "epoch": epoch + 1,
+                    "config": cfg,
                 },
                 ckpt_path,
             )
             print(f"Saved: {ckpt_path}")
+
+        print(
+            f"epoch_{epoch + 1}: awareness_loss={np.mean(awareness_loss_list):.6f}, "
+            f"seg_loss={np.mean(seg_loss_list):.6f}, "
+            f"global_anomaly_loss={np.mean(global_anomaly_loss_list):.6f}, "
+            f"total_loss={np.mean(total_loss_list):.6f}, "
+            f"time={time.time() - start_time:.2f}s"
+        )
 
     print("Training completed!")
 

@@ -3,212 +3,325 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict
-
-# 添加项目根目录到 Python 路径
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+from typing import Dict, List
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision.transforms import functional as F
 
-from src.models.anomaly_detector import AnomalyDetector
+# 添加项目根目录到 Python 路径
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.models.ad_adapter import CLIPInplanted as AdapterModel
 from src.models.dinov3_backbone import Dinov3Backbone
+from src.utils.ad_clip import create_clip_model_and_tokenizer, encode_text_with_prompt_ensemble
 from src.utils.config import load_config
 from src.utils.visualization import visualize_segmentation
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Test AD-DINOv3 Model")
+    parser = argparse.ArgumentParser(description="Test AD-DINOv3 Adapter Model")
     parser.add_argument("--config", type=str, required=True, help="Config file path")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Adapter checkpoint path")
     parser.add_argument("--input", type=str, required=True, help="Input image or directory")
     parser.add_argument("--output", type=str, default="test_results/ad_dinov3", help="Output directory")
     parser.add_argument("--threshold", type=float, default=0.5, help="Anomaly threshold")
     parser.add_argument("--show", action="store_true", help="Show visualization")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument("--object-name", type=str, default="defect", help="Prompt object name (fallback)")
     return parser.parse_args()
 
 
-def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
-    """加载AD-DINOv3模型"""
+def normalize_imagenet(images: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor(IMAGENET_MEAN, device=images.device).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=images.device).view(1, 3, 1, 1)
+    return (images - mean) / std
+
+
+def get_feature_dinov3(batch_img: torch.Tensor, device: torch.device, dino_model):
+    with torch.no_grad():
+        depth = len(dino_model.blocks)
+        idxs = [int(round((depth - 1) * k / (4 - 1))) for k in range(4)]
+        layers = sorted(set([max(0, min(depth - 1, idx)) for idx in idxs]))
+
+        patch_tokens_dict = {idx: [] for idx in layers}
+        cls_tokens_dict = {idx: [] for idx in layers}
+
+        anchor = getattr(dino_model, "norm", None) or getattr(dino_model, "fc_norm", None)
+        if anchor is None:
+            raise ValueError("DINO model has no norm/fc_norm module for feature extraction.")
+
+        for sample_idx in range(batch_img.shape[0]):
+            tokens_dict = {}
+            handles = []
+            image = batch_img[sample_idx].unsqueeze(0).to(device)
+
+            for layer_idx in layers:
+                def _mk_hook(idx):
+                    def _hook(_module, _inp, out):
+                        tokens_dict[idx] = anchor(out[0]).detach().cpu()
+
+                    return _hook
+
+                handles.append(dino_model.blocks[layer_idx].register_forward_hook(_mk_hook(layer_idx)))
+
+            _ = dino_model(image)
+            for handle in handles:
+                handle.remove()
+
+            for layer_idx, tokens in tokens_dict.items():
+                patch_tokens = tokens[:, 5:, :]
+                patch_tokens = (patch_tokens - patch_tokens.mean(dim=1, keepdim=True)) / (
+                    patch_tokens.std(dim=1, keepdim=True) + 1e-6
+                )
+                cls_tokens = tokens[:, 0, :].unsqueeze(1)
+                patch_tokens_dict[layer_idx].append(patch_tokens)
+                cls_tokens_dict[layer_idx].append(cls_tokens)
+
+        patch_tokens = [torch.cat(patch_tokens_dict[idx], dim=0).to(device) for idx in layers]
+        cls_token = [torch.cat(cls_tokens_dict[idx], dim=0).to(device) for idx in layers]
+        return cls_token, patch_tokens
+
+
+def infer_anomaly_map(
+    clip_model,
+    clip_tokenizer,
+    adapter_model,
+    dino_model,
+    image_tensor: torch.Tensor,
+    device: torch.device,
+    obj_name: str,
+) -> np.ndarray:
+    image_tensor = image_tensor.to(device)
+    image_tensor = normalize_imagenet(image_tensor)
+
+    batch_size = image_tensor.shape[0]
+    text_feature = torch.zeros(batch_size, 768, 2, device=device)
+    with torch.no_grad():
+        for i in range(batch_size):
+            text_feature[i] = encode_text_with_prompt_ensemble(clip_model, clip_tokenizer, obj_name, device)
+
+    adjusted_feats_0 = []
+    adjusted_feats_1 = []
+    for i in range(batch_size):
+        f0 = adapter_model.prompt_adapter[0](text_feature[i, :, 0])[0]
+        f1 = adapter_model.prompt_adapter[1](text_feature[i, :, 1])[0]
+        adjusted_feats_0.append(f0)
+        adjusted_feats_1.append(f1)
+
+    adjusted_feats_0 = torch.stack(adjusted_feats_0, dim=0)
+    adjusted_feats_1 = torch.stack(adjusted_feats_1, dim=0)
+    adjusted_text_feature = torch.cat([adjusted_feats_0, adjusted_feats_1], dim=1).view(batch_size, 768, 2)
+
+    cls_token, patch_tokens = get_feature_dinov3(image_tensor, device, dino_model)
+
+    anomaly_maps_cross_modal = []
+    for i in range(4):
+        patch_features = adapter_model.patch_token_adapter[i](patch_tokens[i])[0]
+        patch_features = patch_features / (patch_features.norm(dim=-1, keepdim=True) + 1e-6)
+
+        anomaly_map_cross_modal = 100 * patch_features @ adjusted_text_feature
+        s = int((patch_tokens[i].shape[1]) ** 0.5)
+        anomaly_map_cross_modal = F.interpolate(
+            anomaly_map_cross_modal.permute(0, 2, 1).view(-1, 2, s, s),
+            size=image_tensor.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        anomaly_map_cross_modal = torch.softmax(anomaly_map_cross_modal, dim=1)
+        anomaly_maps_cross_modal.append(anomaly_map_cross_modal)
+
+    anomaly_map_cross_modal = torch.mean(torch.stack(anomaly_maps_cross_modal, dim=0), dim=0)
+    anomaly_map = anomaly_map_cross_modal[:, 1, :, :]
+    return anomaly_map.squeeze(0).detach().cpu().numpy()
+
+
+def preprocess_image(image_path: Path, resize: tuple | None):
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    if resize is not None:
+        image_resized = F.resize(image, resize, interpolation=Image.BILINEAR)
+    else:
+        image_resized = image
+
+    image_tensor = F.to_tensor(image_resized).unsqueeze(0)
+    return image_tensor, np.array(image), original_size
+
+
+def resolve_object_name(image_path: Path, fallback_name: str) -> str:
+    # 参考仓库默认从路径中取类名；这里保留回退策略
+    parts = image_path.as_posix().split("/")
+    if len(parts) >= 4:
+        return parts[-4]
+    return fallback_name
+
+
+def load_models(cfg: Dict, checkpoint_path: str, device: torch.device):
     model_cfg: Dict = cfg["model"]
-    
+    clip_cfg: Dict = model_cfg.get("clip", {})
+
     backbone = Dinov3Backbone(
         dinov3_repo_path=model_cfg["dinov3_repo_path"],
         model_name=model_cfg["model_name"],
         pretrained_path=model_cfg.get("pretrained_path"),
         patch_size=model_cfg["patch_size"],
         embed_dim=model_cfg["embed_dim"],
-        download=model_cfg.get("download", False)
+        download=model_cfg.get("download", False),
     )
-    
-    # 构建异常检测器
-    detector = AnomalyDetector(
-        backbone=backbone,
-        memory_bank_size=model_cfg.get("memory_bank_size", 2000),
-        use_multi_scale=model_cfg.get("use_multi_scale", True),
+    dino_model = backbone.model.to(device)
+    dino_model.eval()
+
+    clip_model_name = clip_cfg.get("model_name", "ViT-L-14-336")
+    clip_pretrained = clip_cfg.get("pretrained", "CLIP/ViT-L-14-336px.pt")
+    clip_download = bool(clip_cfg.get("download", False))
+
+    clip_model, clip_tokenizer = create_clip_model_and_tokenizer(
+        model_name=clip_model_name,
+        pretrained=clip_pretrained,
+        device=device,
+        allow_download=clip_download,
     )
-    
-    # 加载权重
+    clip_model.to(device)
+    clip_model.eval()
+
+    adapter_model = AdapterModel(c_in=model_cfg.get("embed_dim", 1024), _device=device)
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    # train_ad.py 保存格式：{"detector": ..., "memory_bank": ..., "epoch": ...}
-    detector.load_state_dict(ckpt.get("detector", ckpt), strict=False)
-    if "memory_bank" in ckpt:
-        detector.memory_bank.load_state_dict(ckpt["memory_bank"], strict=False)
 
-    # 兼容旧 checkpoint：历史 bug 可能导致「实际写满但 is_full=False 且 ptr=0」
-    # 这种情况下推理会把记忆库误判为空，得到常数分数图。
-    ptr = int(detector.memory_bank.ptr.item())
-    is_full = bool(detector.memory_bank.is_full.item())
-    if (not is_full) and ptr == 0:
-        has_nonzero_bank = bool(torch.any(detector.memory_bank.features != 0).item())
-        if has_nonzero_bank:
-            detector.memory_bank.is_full[0] = True
-            print("Recovered memory bank state from legacy checkpoint: set is_full=True.")
+    adapter_model.cls_token_adapter.load_state_dict(ckpt["cls_token_adapter"], strict=False)
+    adapter_model.patch_token_adapter.load_state_dict(ckpt["patch_token_adapter"], strict=False)
+    adapter_model.prompt_adapter.load_state_dict(ckpt["prompt_adapter"], strict=False)
+    adapter_model.to(device)
+    adapter_model.eval()
 
-    detector.to(device)
-    detector.eval()
-
-    bank_ptr = int(detector.memory_bank.ptr.item())
-    bank_full = bool(detector.memory_bank.is_full.item())
-    bank_size = detector.memory_bank.bank_size if bank_full else bank_ptr
-    print(f"Memory bank status - size: {bank_size}/{detector.memory_bank.bank_size}, ptr: {bank_ptr}, is_full: {bank_full}")
-    if bank_size == 0:
-        print("Warning: memory bank is empty. Anomaly map may become near-constant and detection masks can be blank.")
-    
-    return detector
-
-
-def preprocess_image(image_path: str | Path, resize: tuple | None = None):
-    """预处理图像"""
-    image = Image.open(image_path).convert("RGB")
-    original_size = image.size
-    
-    if resize is not None:
-        image_resized = F.resize(image, resize, interpolation=Image.BILINEAR)
-    else:
-        image_resized = image
-    
-    image_tensor = F.to_tensor(image_resized).unsqueeze(0)
-    
-    return image_tensor, np.array(image), original_size
-
-
-@torch.no_grad()
-def predict(detector, image_tensor: torch.Tensor, device: torch.device, original_size: tuple):
-    """模型推理"""
-    image_tensor = image_tensor.to(device)
-    
-    # 获取异常分数图（已经是 0-1 范围的距离分数）
-    anomaly_map = detector(image_tensor)
-    # 在浮点张量空间完成 resize，避免 uint8 量化带来的伪影
-    target_h, target_w = original_size[1], original_size[0]
-    anomaly_map = torch.nn.functional.interpolate(
-        anomaly_map,
-        size=(target_h, target_w),
-        mode="bilinear",
-        align_corners=False,
-    )
-    anomaly_map = anomaly_map.squeeze(0).squeeze(0).clamp(0.0, 1.0).cpu().numpy()
-    
-    return anomaly_map
-
-
-def process_single_image(
-    detector,
-    image_path: Path,
-    output_dir: Path,
-    resize: tuple | None,
-    threshold: float,
-    device: torch.device,
-    show: bool,
-    relative_path: Path | None = None,
-):
-    """处理单张图像"""
-    print(f"Processing: {image_path}")
-    
-    # 预处理
-    image_tensor, image_np, original_size = preprocess_image(image_path, resize)
-    
-    # 推理
-    anomaly_map = predict(detector, image_tensor, device, original_size)
-
-    # 二值化预测图（0=正常, 1=异常）
-    pred_mask = (anomaly_map > threshold).astype(np.uint8)
-    
-    # 计算统计信息
-    max_score = anomaly_map.max()
-    mean_score = anomaly_map.mean()
-    anomaly_pixels = (anomaly_map > threshold).sum()
-    total_pixels = anomaly_map.size
-    anomaly_ratio = anomaly_pixels / total_pixels * 100
-    
-    print(f"  Max Score: {max_score:.3f}, Mean Score: {mean_score:.3f}")
-    print(f"  Anomaly Ratio: {anomaly_ratio:.2f}% (threshold={threshold})")
-    
-    # 确定输出路径（保持目录结构）
-    if relative_path:
-        output_subdir = output_dir / relative_path.parent
-        output_subdir.mkdir(parents=True, exist_ok=True)
-        output_path = output_subdir / f"{image_path.stem}_result.png"
-    else:
-        output_path = output_dir / f"{image_path.stem}_result.png"
-    
-    # 可视化（仿照 test_supervised：仅原图 + 预测图）
-    visualize_segmentation(
-        image=image_np,
-        pred_mask=pred_mask,
-        gt_mask=None,
-        label_map={"background": 0, "anomaly": 1},
-        save_path=output_path,
-        show=show,
-    )
+    print("Loaded adapter checkpoint successfully.")
+    return clip_model, clip_tokenizer, adapter_model, dino_model
 
 
 def main():
     args = parse_args()
-    
-    # 加载配置
+
     cfg = load_config(args.config)
     data_cfg = cfg.get("data", {})
     resize = tuple(data_cfg["resize"]) if data_cfg.get("resize") else None
-    
-    # 设置设备
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # 加载模型
+
     print(f"Loading model from: {args.checkpoint}")
-    detector = load_model(cfg, args.checkpoint, device)
-    
-    # 准备输出目录
+    clip_model, clip_tokenizer, adapter_model, dino_model = load_models(cfg, args.checkpoint, device)
+
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 处理输入
+
     input_path = Path(args.input)
+
     if input_path.is_file():
-        # 单张图片
-        process_single_image(detector, input_path, output_dir, resize, args.threshold, device, args.show)
+        image_tensor, image_np, original_size = preprocess_image(input_path, resize)
+        obj_name = resolve_object_name(input_path, args.object_name)
+        anomaly_map = infer_anomaly_map(
+            clip_model, clip_tokenizer, adapter_model, dino_model, image_tensor, device, obj_name
+        )
+
+        anomaly_image = Image.fromarray((anomaly_map * 255).astype(np.uint8))
+        anomaly_image = anomaly_image.resize(original_size, Image.BILINEAR)
+        anomaly_map = np.array(anomaly_image).astype(np.float32) / 255.0
+
+        score_min = float(anomaly_map.min())
+        score_max = float(anomaly_map.max())
+        anomaly_map_norm = (
+            (anomaly_map - score_min) / (score_max - score_min)
+            if score_max - score_min > 1e-8
+            else np.zeros_like(anomaly_map, dtype=np.float32)
+        )
+        pred_mask = (anomaly_map_norm > args.threshold).astype(np.uint8)
+
+        print(f"Processing: {input_path}")
+        print(f"  Raw Score - min: {score_min:.4f}, max: {float(anomaly_map.max()):.4f}, mean: {float(anomaly_map.mean()):.4f}")
+        print(
+            f"  Norm Score - min: {float(anomaly_map_norm.min()):.4f}, max: {float(anomaly_map_norm.max()):.4f}, mean: {float(anomaly_map_norm.mean()):.4f}"
+        )
+
+        output_path = output_dir / f"{input_path.stem}_result.png"
+        visualize_segmentation(
+            image=image_np,
+            pred_mask=pred_mask,
+            gt_mask=None,
+            label_map={"background": 0, "anomaly": 1},
+            save_path=output_path,
+            show=args.show,
+        )
     elif input_path.is_dir():
-        # 目录（递归查找）
         image_exts = data_cfg.get("image_exts", [".png", ".jpg", ".jpeg"])
-        image_files = []
+        image_files: List[Path] = []
         for ext in image_exts:
-            image_files.extend(input_path.rglob(f"*{ext}"))  # 使用 rglob 递归查找
-        
+            image_files.extend(input_path.rglob(f"*{ext}"))
+
         print(f"Found {len(image_files)} images in {input_path} (including subdirectories)")
+
+        raw_results = []
         for image_file in sorted(image_files):
-            # 计算相对路径以保持目录结构
-            relative_path = image_file.relative_to(input_path)
-            process_single_image(detector, image_file, output_dir, resize, args.threshold, device, args.show, relative_path)
+            image_tensor, image_np, original_size = preprocess_image(image_file, resize)
+            obj_name = resolve_object_name(image_file, args.object_name)
+            anomaly_map = infer_anomaly_map(
+                clip_model, clip_tokenizer, adapter_model, dino_model, image_tensor, device, obj_name
+            )
+
+            anomaly_image = Image.fromarray((anomaly_map * 255).astype(np.uint8))
+            anomaly_image = anomaly_image.resize(original_size, Image.BILINEAR)
+            anomaly_map = np.array(anomaly_image).astype(np.float32) / 255.0
+            raw_results.append((image_file, image_np, anomaly_map, image_file.relative_to(input_path)))
+
+        if len(raw_results) > 0:
+            global_min = min(float(r[2].min()) for r in raw_results)
+            global_max = max(float(r[2].max()) for r in raw_results)
+            denom = global_max - global_min
+        else:
+            global_min, global_max, denom = 0.0, 1.0, 1.0
+
+        print(f"Global score range - min: {global_min:.4f}, max: {global_max:.4f}")
+
+        for image_file, image_np, anomaly_map, relative_path in raw_results:
+            if denom > 1e-8:
+                anomaly_map_norm = (anomaly_map - global_min) / denom
+            else:
+                anomaly_map_norm = np.zeros_like(anomaly_map, dtype=np.float32)
+
+            pred_mask = (anomaly_map_norm > args.threshold).astype(np.uint8)
+
+            anomaly_pixels = int((anomaly_map_norm > args.threshold).sum())
+            total_pixels = anomaly_map_norm.size
+            anomaly_ratio = anomaly_pixels / max(total_pixels, 1) * 100
+
+            print(f"Processing: {image_file}")
+            print(
+                f"  Raw Score - min: {float(anomaly_map.min()):.4f}, max: {float(anomaly_map.max()):.4f}, mean: {float(anomaly_map.mean()):.4f}"
+            )
+            print(
+                f"  Norm Score - min: {float(anomaly_map_norm.min()):.4f}, max: {float(anomaly_map_norm.max()):.4f}, mean: {float(anomaly_map_norm.mean()):.4f}"
+            )
+            print(f"  Anomaly Ratio: {anomaly_ratio:.2f}% (threshold={args.threshold})")
+
+            output_subdir = output_dir / relative_path.parent
+            output_subdir.mkdir(parents=True, exist_ok=True)
+            output_path = output_subdir / f"{image_file.stem}_result.png"
+
+            visualize_segmentation(
+                image=image_np,
+                pred_mask=pred_mask,
+                gt_mask=None,
+                label_map={"background": 0, "anomaly": 1},
+                save_path=output_path,
+                show=args.show,
+            )
     else:
         raise ValueError(f"Invalid input path: {input_path}")
-    
+
     print(f"\n✓ All results saved to: {output_dir}")
 
 
