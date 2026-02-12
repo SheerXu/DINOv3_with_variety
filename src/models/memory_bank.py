@@ -62,19 +62,34 @@ class MemoryBank(nn.Module):
         
         query_features = F.normalize(query_features, dim=1)
         
-        # 相似度矩阵: (N, bank_size)
+        # 检查记忆库是否为空
         bank_size = int(self.ptr) if not self.is_full else self.bank_size
-        similarity = torch.mm(query_features, self.features[:bank_size].t())
+        if bank_size == 0:
+            # 记忆库为空，返回中性异常分数（0.5）
+            anomaly_scores = torch.full(
+                (query_features.shape[0],), 
+                0.5, 
+                dtype=query_features.dtype, 
+                device=query_features.device
+            )
+        else:
+            # 相似度矩阵: (N, bank_size)
+            similarity = torch.mm(query_features, self.features[:bank_size].t())
+            
+            # 距离 = (1 - 余弦相似度) / 2，确保范围在 [0, 1]
+            # 余弦相似度范围 [-1, 1]，所以 (1 - similarity) 范围 [0, 2]
+            # 除以 2 后范围变为 [0, 1]
+            distances = (1 - similarity) / 2.0
+            
+            # 取 top-k 最近邻的平均距离
+            k_actual = min(k, bank_size)
+            topk_distances, _ = torch.topk(distances, k=k_actual, dim=1, largest=False)
+            anomaly_scores = topk_distances.mean(dim=1)
+            
+            # 确保值在 [0, 1] 范围内，防止数值误差
+            anomaly_scores = anomaly_scores.clamp(0.0, 1.0)
         
-        # 距离 = (1 - 余弦相似度) / 2，确保范围在 [0, 1]
-        # 余弦相似度范围 [-1, 1]，所以 (1 - similarity) 范围 [0, 2]
-        # 除以 2 后范围变为 [0, 1]
-        distances = (1 - similarity) / 2.0
-        
-        # 取 top-k 最近邻的平均距离
-        topk_distances, _ = torch.topk(distances, k=min(k, bank_size), dim=1, largest=False)
-        anomaly_scores = topk_distances.mean(dim=1)
-        
+        # 恢复原始形状
         if len(original_shape) == 4:
             anomaly_scores = anomaly_scores.view(b, h, w, 1).permute(0, 3, 1, 2)
         

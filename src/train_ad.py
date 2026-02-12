@@ -86,12 +86,18 @@ def main() -> None:
 
     print(f"Training AD-DINOv3 for {epochs} epochs")
     print(f"Memory bank warmup: {warmup_epochs} epochs")
+    print(f"Memory bank size: {model_cfg.get('memory_bank_size', 1000)}")
+    print(f"Initial bank state - ptr: {detector.memory_bank.ptr.item()}, is_full: {detector.memory_bank.is_full.item()}\n")
 
     for epoch in range(1, epochs + 1):
         detector.train()
         total_loss = 0.0
         total_focal = 0.0
         total_dist = 0.0
+        
+        # 打印当前 epoch 的记忆库状态
+        bank_ptr = int(detector.memory_bank.ptr.item())
+        print(f"Epoch {epoch} - Memory bank contains {bank_ptr} samples")
 
         for step, (images, masks, labels) in enumerate(train_loader, start=1):
             images = images.to(device)
@@ -115,9 +121,21 @@ def main() -> None:
             # Focal Loss for anomaly segmentation（在 autocast 外部计算 BCE）
             pred_flat = anomaly_map.view(-1)
             target_flat = masks.view(-1)
-            # anomaly_map 已经是 0-1 范围的异常分数，可以直接计算 BCE
-            # 使用 clamp 避免数值问题
-            pred_flat = pred_flat.clamp(min=1e-7, max=1 - 1e-7)
+            
+            # 第一个 batch 输出调试信息
+            if epoch == 1 and step == 1:
+                print(f"  anomaly_map stats - min: {anomaly_map.min().item():.4f}, "
+                      f"max: {anomaly_map.max().item():.4f}, "
+                      f"mean: {anomaly_map.mean().item():.4f}, "
+                      f"has_nan: {torch.isnan(anomaly_map).any().item()}, "
+                      f"has_inf: {torch.isinf(anomaly_map).any().item()}")
+            
+            # 检查并修正异常值
+            # 替换 NaN 和 Inf 为安全值
+            pred_flat = torch.nan_to_num(pred_flat, nan=0.5, posinf=1.0, neginf=0.0)
+            # anomaly_map 应该在 0-1 范围，使用 clamp 确保
+            pred_flat = pred_flat.clamp(min=1e-7, max=1.0 - 1e-7)
+            
             bce_loss = F.binary_cross_entropy(
                 pred_flat, target_flat, reduction="none"
             )
