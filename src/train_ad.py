@@ -108,8 +108,11 @@ def main() -> None:
                 # 1. Focal Loss for anomaly segmentation
                 pred_flat = anomaly_map.view(-1)
                 target_flat = masks.view(-1)
+                # anomaly_map 已经是 0-1 范围的异常分数，可以直接计算 BCE
+                # 使用 clamp 避免数值问题
+                pred_flat = pred_flat.clamp(min=1e-7, max=1 - 1e-7)
                 bce_loss = F.binary_cross_entropy(
-                    torch.sigmoid(pred_flat), target_flat, reduction="none"
+                    pred_flat, target_flat, reduction="none"
                 )
                 pt = torch.exp(-bce_loss)
                 focal_loss = ((1 - pt) ** 2 * bce_loss).mean()

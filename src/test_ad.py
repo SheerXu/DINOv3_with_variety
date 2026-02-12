@@ -84,9 +84,9 @@ def predict(detector, image_tensor: torch.Tensor, device: torch.device, original
     """模型推理"""
     image_tensor = image_tensor.to(device)
     
-    # 获取异常分数图
+    # 获取异常分数图（已经是 0-1 范围的距离分数）
     anomaly_map = detector(image_tensor)
-    anomaly_map = torch.sigmoid(anomaly_map).squeeze(0).squeeze(0).cpu().numpy()
+    anomaly_map = anomaly_map.squeeze(0).squeeze(0).cpu().numpy()
     
     # 调整到原始尺寸
     anomaly_image = Image.fromarray((anomaly_map * 255).astype(np.uint8))
