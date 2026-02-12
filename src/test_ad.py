@@ -104,9 +104,10 @@ def process_single_image(
     threshold: float,
     device: torch.device,
     show: bool,
+    relative_path: Path | None = None,
 ):
     """处理单张图像"""
-    print(f"Processing: {image_path.name}")
+    print(f"Processing: {image_path}")
     
     # 预处理
     image_tensor, image_np, original_size = preprocess_image(image_path, resize)
@@ -124,8 +125,15 @@ def process_single_image(
     print(f"  Max Score: {max_score:.3f}, Mean Score: {mean_score:.3f}")
     print(f"  Anomaly Ratio: {anomaly_ratio:.2f}% (threshold={threshold})")
     
+    # 确定输出路径（保持目录结构）
+    if relative_path:
+        output_subdir = output_dir / relative_path.parent
+        output_subdir.mkdir(parents=True, exist_ok=True)
+        output_path = output_subdir / f"{image_path.stem}_result.png"
+    else:
+        output_path = output_dir / f"{image_path.stem}_result.png"
+    
     # 可视化
-    output_path = output_dir / f"{image_path.stem}_result.png"
     visualize_anomaly(
         image=image_np,
         anomaly_map=anomaly_map,
@@ -162,15 +170,17 @@ def main():
         # 单张图片
         process_single_image(detector, input_path, output_dir, resize, args.threshold, device, args.show)
     elif input_path.is_dir():
-        # 目录
+        # 目录（递归查找）
         image_exts = data_cfg.get("image_exts", [".png", ".jpg", ".jpeg"])
         image_files = []
         for ext in image_exts:
-            image_files.extend(input_path.glob(f"*{ext}"))
+            image_files.extend(input_path.rglob(f"*{ext}"))  # 使用 rglob 递归查找
         
-        print(f"Found {len(image_files)} images")
+        print(f"Found {len(image_files)} images in {input_path} (including subdirectories)")
         for image_file in sorted(image_files):
-            process_single_image(detector, image_file, output_dir, resize, args.threshold, device, args.show)
+            # 计算相对路径以保持目录结构
+            relative_path = image_file.relative_to(input_path)
+            process_single_image(detector, image_file, output_dir, resize, args.threshold, device, args.show, relative_path)
     else:
         raise ValueError(f"Invalid input path: {input_path}")
     
