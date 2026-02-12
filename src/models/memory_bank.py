@@ -41,9 +41,13 @@ class MemoryBank(nn.Module):
             batch_size = self.bank_size
 
         ptr = int(self.ptr.item())
+        start_ptr = ptr
         if ptr + batch_size <= self.bank_size:
             self.features[ptr : ptr + batch_size] = features
             ptr = (ptr + batch_size) % self.bank_size
+            # 精确写满一整圈时，ptr 会回到 0；此时记忆库应标记为已满。
+            if start_ptr + batch_size >= self.bank_size and batch_size > 0:
+                self.is_full[0] = True
         else:
             # 循环覆盖
             remain = self.bank_size - ptr

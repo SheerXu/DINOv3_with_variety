@@ -59,8 +59,26 @@ def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
     detector.load_state_dict(ckpt.get("detector", ckpt), strict=False)
     if "memory_bank" in ckpt:
         detector.memory_bank.load_state_dict(ckpt["memory_bank"], strict=False)
+
+    # 兼容旧 checkpoint：历史 bug 可能导致「实际写满但 is_full=False 且 ptr=0」
+    # 这种情况下推理会把记忆库误判为空，得到常数分数图。
+    ptr = int(detector.memory_bank.ptr.item())
+    is_full = bool(detector.memory_bank.is_full.item())
+    if (not is_full) and ptr == 0:
+        has_nonzero_bank = bool(torch.any(detector.memory_bank.features != 0).item())
+        if has_nonzero_bank:
+            detector.memory_bank.is_full[0] = True
+            print("Recovered memory bank state from legacy checkpoint: set is_full=True.")
+
     detector.to(device)
     detector.eval()
+
+    bank_ptr = int(detector.memory_bank.ptr.item())
+    bank_full = bool(detector.memory_bank.is_full.item())
+    bank_size = detector.memory_bank.bank_size if bank_full else bank_ptr
+    print(f"Memory bank status - size: {bank_size}/{detector.memory_bank.bank_size}, ptr: {bank_ptr}, is_full: {bank_full}")
+    if bank_size == 0:
+        print("Warning: memory bank is empty. Anomaly map may become near-constant and detection masks can be blank.")
     
     return detector
 
