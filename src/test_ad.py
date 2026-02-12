@@ -37,8 +37,7 @@ def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
     """加载AD-DINOv3模型"""
     model_cfg: Dict = cfg["model"]
     
-    # 构建Teacher骨干网络
-    teacher_backbone = Dinov3Backbone(
+    backbone = Dinov3Backbone(
         dinov3_repo_path=model_cfg["dinov3_repo_path"],
         model_name=model_cfg["model_name"],
         pretrained_path=model_cfg.get("pretrained_path"),
@@ -49,15 +48,17 @@ def load_model(cfg: Dict, checkpoint_path: str, device: torch.device):
     
     # 构建异常检测器
     detector = AnomalyDetector(
-        teacher_backbone=teacher_backbone,
-        embed_dim=model_cfg["embed_dim"],
+        backbone=backbone,
         memory_bank_size=model_cfg.get("memory_bank_size", 2000),
         use_multi_scale=model_cfg.get("use_multi_scale", True),
     )
     
     # 加载权重
     ckpt = torch.load(checkpoint_path, map_location="cpu")
-    detector.load_state_dict(ckpt.get("model", ckpt), strict=False)
+    # train_ad.py 保存格式：{"detector": ..., "memory_bank": ..., "epoch": ...}
+    detector.load_state_dict(ckpt.get("detector", ckpt), strict=False)
+    if "memory_bank" in ckpt:
+        detector.memory_bank.load_state_dict(ckpt["memory_bank"], strict=False)
     detector.to(device)
     detector.eval()
     

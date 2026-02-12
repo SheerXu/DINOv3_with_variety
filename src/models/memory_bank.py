@@ -31,7 +31,16 @@ class MemoryBank(nn.Module):
         features = F.normalize(features, dim=1)
         batch_size = features.shape[0]
 
-        ptr = int(self.ptr)
+        # 当输入特征数量大于记忆库容量时（例如 B*H*W 很大），
+        # 直接按原逻辑写入会导致切片越界/形状不匹配。
+        # 这里将特征下采样到最多 bank_size 条，保证写入安全。
+        if batch_size > self.bank_size:
+            # 使用均匀采样，避免引入额外随机性影响复现
+            idx = torch.linspace(0, batch_size - 1, steps=self.bank_size, device=features.device).long()
+            features = features.index_select(0, idx)
+            batch_size = self.bank_size
+
+        ptr = int(self.ptr.item())
         if ptr + batch_size <= self.bank_size:
             self.features[ptr : ptr + batch_size] = features
             ptr = (ptr + batch_size) % self.bank_size
@@ -63,7 +72,8 @@ class MemoryBank(nn.Module):
         query_features = F.normalize(query_features, dim=1)
         
         # 检查记忆库是否为空
-        bank_size = int(self.ptr) if not self.is_full else self.bank_size
+        is_full = bool(self.is_full.item())
+        bank_size = int(self.ptr.item()) if not is_full else self.bank_size
         if bank_size == 0:
             # 记忆库为空，返回中性异常分数（0.5）
             # 使用可微分操作保持计算图，避免梯度断裂

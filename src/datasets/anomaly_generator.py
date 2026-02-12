@@ -35,14 +35,13 @@ class AnomalyGenerator:
         w, h = image.size
         mask = Image.new("L", (w, h), 0)
         
+        # 该函数语义是“生成异常样本”。因此不应返回正常图像/空掩码，
+        # 否则会出现 label=1 但 mask 全 0 的训练噪声。
         method = random.random()
         if method < self.cutpaste_ratio:
             aug_image, mask = self._cutpaste(image)
-        elif method < self.cutpaste_ratio + self.perlin_ratio:
-            aug_image, mask = self._perlin_noise(image)
         else:
-            # 保持正常样本
-            aug_image = image.copy()
+            aug_image, mask = self._perlin_noise(image)
         
         return aug_image, mask
 
@@ -78,9 +77,9 @@ class AnomalyGenerator:
         """Perlin 噪声生成纹理异常"""
         w, h = image.size
         
-        # 简化版：使用高斯噪声模拟
-        noise = np.random.randn(h, w, 3) * 50
-        noise = np.clip(noise, -50, 50).astype(np.uint8)
+        # 简化版：使用高斯噪声模拟（生成合法的 uint8 图像，避免负值 cast 回绕）
+        noise = np.random.randn(h, w, 3) * 50 + 127.5
+        noise = np.clip(noise, 0, 255).astype(np.uint8)
         noise_img = Image.fromarray(noise, mode="RGB")
         
         # 随机掩码区域
@@ -97,8 +96,7 @@ class AnomalyGenerator:
         mask = Image.fromarray(mask_arr, mode="L")
         mask_blur = mask.filter(ImageFilter.GaussianBlur(radius=5))
         
-        # 混合
-        alpha = random.uniform(*self.blend_alpha)
+        # 混合（mask=255 位置使用 noise_img，否则使用原图）
         aug_image = Image.composite(noise_img, image, mask_blur)
         
         return aug_image, mask
